@@ -18,8 +18,12 @@
 '''
 
 import argparse
+import ast
 import asyncio
+import codeop
+from dataclasses import dataclass
 import io
+import math
 import moteus
 import moteus.moteus_tool
 import numpy
@@ -73,6 +77,50 @@ if os.environ['QT_API'] == 'pyside6':
 import asyncqt
 
 import moteus.reader as reader
+import moteus.multiplex
+from moteus import Register, Mode
+
+
+# Fault monitoring configuration
+FAULT_POLLING_INTERVAL_MS = 500
+
+# Fault code descriptions from docs/reference.md
+FAULT_CODE_DESCRIPTIONS = {
+    32: "calibration fault",
+    33: "motor driver fault",
+    34: "over voltage",
+    35: "encoder fault",
+    36: "motor not configured",
+    37: "pwm cycle overrun",
+    38: "over temperature",
+    39: "outside limit",
+    40: "under voltage",
+    41: "config changed",
+    42: "theta invalid",
+    43: "position invalid",
+    44: "driver enable fault",
+    45: "stop position deprecated",
+    46: "timing violation",
+    47: "bemf feedforward without accel",
+    48: "invalid limits",
+    96: "limit: servo.max_velocity",
+    97: "limit: servo.max_power_W",
+    98: "limit: max system voltage",
+    99: "limit: servo.max_current_A",
+    100: "limit: servo.fault_temperature",
+    101: "limit: servo.motor_fault_temperature",
+    102: "limit: commanded max torque",
+    103: "limit: servopos limit",
+}
+
+
+@dataclass
+class FaultState:
+    """Tracks fault status and user observation for a device."""
+    is_faulted: bool = False
+    observed: bool = True  # Default to observed (no flashing for non-faulty devices)
+    current_mode: int = None  # Current mode register value
+    current_fault_code: int = None  # Current fault register value
 
 
 try:
@@ -161,6 +209,43 @@ def _add_schema_item(parent, element, terminal_flags=None):
         if terminal_flags:
             parent.setFlags(terminal_flags)
 
+def _is_servo_stats_fault_field(item):
+    """Check if the tree widget item represents a servo_stats.fault field."""
+    # Check if this is a leaf node (has no children and is displaying a value)
+    if item.childCount() > 0:
+        return False
+
+    # Get the field name
+    field_name = item.text(0).lower()
+    if field_name != "fault":
+        return False
+
+    # Check if parent is servo_stats
+    parent = item.parent()
+    if parent is None:
+        return False
+
+    parent_name = parent.text(0).lower()
+    return parent_name == "servo_stats"
+
+def _format_fault_code(fault_code):
+    """Format a fault code with human-readable description.
+
+    Args:
+        fault_code: Integer fault code (can be None)
+
+    Returns:
+        str: Formatted fault code string, "0" for no fault, empty string for None
+    """
+    if fault_code is None:
+        return ""
+
+    if fault_code == 0:
+        return "0"
+
+    description = FAULT_CODE_DESCRIPTIONS.get(fault_code, "unknown fault code")
+    return f"{fault_code} ({description})"
+
 def _set_tree_widget_data(item, struct, element, terminal_flags=None):
     if (isinstance(element, reader.ObjectType) or
         isinstance(element, reader.ArrayType) or
@@ -187,6 +272,9 @@ def _set_tree_widget_data(item, struct, element, terminal_flags=None):
         text = None
         if maybe_format == FMT_HEX and type(struct) == int:
             text = f"{struct:x}"
+        elif _is_servo_stats_fault_field(item) and isinstance(struct, int):
+            # Special formatting for servo_stats.fault field
+            text = _format_fault_code(struct)
         else:
             text = repr(struct)
         item.setText(1, text)
@@ -423,6 +511,392 @@ class TviewConsoleWidget(HistoryConsoleWidget):
         return True
 
 
+class TviewPythonConsole(HistoryConsoleWidget):
+    def __init__(self, parent=None, get_controller=None):
+        super().__init__(parent)
+
+        self.execute_on_complete_input = False
+
+        # Store our own copies of prompts since qtconsole modifies self._prompt
+        self._main_prompt = '>>> '
+        self._continuation_prompt_str = '... '
+
+        # Initialize the widget's prompt to main prompt
+        self._prompt = self._main_prompt
+        self._continuation_prompt = self._continuation_prompt_str
+
+        self.clear()
+
+        self._append_before_prompt_cursor.setPosition(0)
+
+        # Track currently running async task for cancellation
+        self._current_future = None
+
+        # Buffer for multi-line input
+        self._input_buffer = []
+
+        # Create custom print function for this console
+        def custom_print(*args, sep=' ', end='\n', file=None, flush=False):
+            """Custom print function that outputs to the Python console widget."""
+            output = io.StringIO()
+            print(*args, sep=sep, end=end, file=output)
+            self._append_plain_text(output.getvalue())
+
+        self.namespace = {
+            'transport': None,
+            'controller': None,
+            'get_controller': get_controller,
+            'asyncio': asyncio,
+            'moteus': moteus,
+            'math': math,
+            'time': time,
+            'numpy': numpy,
+            'print': custom_print,  # Custom print for console output
+        }
+
+        # Use a QShortcut for Ctrl+C
+        try:
+            try:
+                from PySide6.QtGui import QShortcut, QKeySequence
+            except ImportError:
+                from PySide6.QtWidgets import QShortcut
+                from PySide6.QtGui import QKeySequence
+            # PySide6 style
+            self._interrupt_shortcut = QShortcut(QKeySequence("Ctrl+C"), self._control)
+            self._interrupt_shortcut.activated.connect(self._handle_interrupt)
+        except ImportError:
+            try:
+                from PySide2.QtWidgets import QShortcut
+                from PySide2.QtGui import QKeySequence
+                # PySide2 requires a lambda wrapper for the callable
+                self._interrupt_shortcut = QShortcut(QKeySequence("Ctrl+C"), self._control, lambda: self._handle_interrupt())
+            except Exception as e:
+                print(f"Warning: Could not set up Ctrl+C shortcut: {e}")
+                self._interrupt_shortcut = None
+
+        for line in """
+# Python REPL for moteus control
+# Available: controller, controllers, get_controller(id), transport, moteus
+#            asyncio, math, numpy, time
+# Use 'await' for async operations
+# Press Ctrl+C to interrupt long-running operations
+""".split('\n'):
+            self._append_plain_text(line + '\n')
+
+        self._show_prompt(self._main_prompt)
+
+    def sizeHint(self):
+        return QtCore.QSize(600, 200)
+
+    def _handle_interrupt(self):
+        """Handle interrupt signal from QShortcut."""
+        # Append KeyboardInterrupt message on a new line
+        self._append_plain_text('\nKeyboardInterrupt\n')
+
+        # Cancel any running future
+        if self._current_future and not self._current_future.done():
+            self._current_future.cancel()
+            self._current_future = None
+
+        # Always clear all state and reset to main prompt
+        self._input_buffer = []
+
+        # Clear any temporary buffers in the widget itself
+        try:
+            self._clear_temporary_buffer()
+        except:
+            pass
+
+        # Finish any existing prompt
+        try:
+            self._prompt_finished()
+        except:
+            pass
+
+        # Force show the main prompt (not continuation)
+        self._show_prompt(self._main_prompt)
+
+    def _is_complete(self, source, interactive):
+        """Check if the source code is complete and ready to execute.
+
+        Returns:
+            (is_complete, indent_needed): Tuple indicating if code is complete
+                                         and if indentation should be added.
+        """
+        try:
+            # Use codeop to determine if the code is complete
+            code = codeop.compile_command(source, '<console>', 'exec')
+
+            if code is None:
+                # More input is needed
+                return False, False
+            else:
+                # Code is complete
+                return True, False
+
+        except (SyntaxError, OverflowError, ValueError):
+            # Code has a syntax error but is complete (will error on execute)
+            return True, False
+
+    def _has_top_level_await(self, source):
+        """Check if source code contains top-level await expressions.
+
+        This detects await expressions that are NOT inside async function definitions.
+        For example:
+        - `await foo()` -> True (needs wrapping)
+        - `async def bar(): await foo()` -> False (already in async context)
+        """
+        try:
+            tree = ast.parse(source)
+
+            # Track which nodes are inside async function definitions
+            async_func_nodes = set()
+
+            # First pass: find all async function definition nodes and their children
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AsyncFunctionDef):
+                    # Mark all descendants of this async function
+                    for child in ast.walk(node):
+                        async_func_nodes.add(id(child))
+
+            # Second pass: find await expressions not inside async functions
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Await):
+                    # Check if this await is NOT inside an async function
+                    if id(node) not in async_func_nodes:
+                        return True
+
+            return False
+        except SyntaxError:
+            # If it doesn't parse, we'll handle the error later
+            return False
+
+    def _has_loops(self, source):
+        """Check if source code contains loops (for/while)."""
+        try:
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.While, ast.For)):
+                    return True
+            return False
+        except SyntaxError:
+            return False
+
+    def _inject_yields_in_loops(self, source):
+        """Transform source code to inject 'await asyncio.sleep(0)' in loop bodies.
+
+        This allows tight loops to be cancelled via CTRL-C by giving the event
+        loop a chance to process cancellation.
+        """
+        try:
+            tree = ast.parse(source)
+
+            class LoopTransformer(ast.NodeTransformer):
+                def visit_While(self, node):
+                    # Visit children first
+                    self.generic_visit(node)
+                    # Inject await asyncio.sleep(0) at the start of the loop body
+                    yield_stmt = ast.Expr(
+                        value=ast.Await(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id='asyncio', ctx=ast.Load()),
+                                    attr='sleep',
+                                    ctx=ast.Load()
+                                ),
+                                args=[ast.Constant(value=0)],
+                                keywords=[]
+                            )
+                        )
+                    )
+                    # Insert at the beginning of the body
+                    node.body = [yield_stmt] + node.body
+                    return node
+
+                def visit_For(self, node):
+                    # Visit children first
+                    self.generic_visit(node)
+                    # Inject await asyncio.sleep(0) at the start of the loop body
+                    yield_stmt = ast.Expr(
+                        value=ast.Await(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id='asyncio', ctx=ast.Load()),
+                                    attr='sleep',
+                                    ctx=ast.Load()
+                                ),
+                                args=[ast.Constant(value=0)],
+                                keywords=[]
+                            )
+                        )
+                    )
+                    # Insert at the beginning of the body
+                    node.body = [yield_stmt] + node.body
+                    return node
+
+            transformer = LoopTransformer()
+            new_tree = transformer.visit(tree)
+            ast.fix_missing_locations(new_tree)
+
+            # Convert back to source code
+            return ast.unparse(new_tree)
+        except Exception:
+            # If transformation fails, return original source
+            return source
+
+    def _execute(self, source, hidden):
+        # Safety check: if we have a running future, we shouldn't be executing new code
+        # This shouldn't normally happen but is defensive
+        if self._current_future and not self._current_future.done():
+            return True
+
+        # If buffer is empty and source is empty, do nothing
+        if not self._input_buffer and not source.strip():
+            self._show_prompt(self._main_prompt)
+            return True
+
+        # Two modes:
+        # 1. Single-line mode (buffer empty): execute complete statements immediately
+        # 2. Multi-line mode (buffer has content): only execute on blank line
+
+        if not self._input_buffer:
+            # Single-line mode: check if this line starts a multi-line block
+            is_complete, indent_needed = self._is_complete(source, True)
+
+            if not is_complete:
+                # This starts a multi-line block - enter multi-line mode
+                self._input_buffer.append(source)
+                self._show_prompt(self._continuation_prompt_str)
+                return True
+            else:
+                # Complete single line - execute immediately
+                full_source = source
+                # Don't add to buffer, execute directly
+        else:
+            # Multi-line mode: we have buffered input
+            if source:
+                # Non-blank line in multi-line mode - add to buffer and continue
+                self._input_buffer.append(source)
+                self._show_prompt(self._continuation_prompt_str)
+                return True
+            else:
+                # Blank line in multi-line mode - check if ready to execute
+                self._input_buffer.append(source)
+                full_source = '\n'.join(self._input_buffer)
+
+                is_complete, indent_needed = self._is_complete(full_source, True)
+
+                if not is_complete:
+                    # Still not complete - continue
+                    self._show_prompt(self._continuation_prompt_str)
+                    return True
+
+                # Complete - execute
+                self._input_buffer = []
+
+        # If the source was just blank lines, don't execute
+        if not full_source.strip():
+            self._show_prompt(self._main_prompt)
+            return True
+
+        loop = asyncio.get_event_loop()
+
+        # Determine if this should run in async context
+        # Use async only if: code has top-level await OR code has loops (for cancellation)
+        has_await = self._has_top_level_await(full_source)
+        has_loops = self._has_loops(full_source)
+        use_async = has_await or has_loops
+
+        try:
+            if use_async:
+                # Inject yield points in loops to allow cancellation of tight loops
+                transformed_source = self._inject_yields_in_loops(full_source)
+
+                # Determine if this is an expression or statement using AST
+                # We can't use compile() because await expressions fail in eval mode
+                is_expression = False
+                try:
+                    tree = ast.parse(transformed_source)
+                    # Check if it's a single expression statement
+                    if (len(tree.body) == 1 and
+                        isinstance(tree.body[0], ast.Expr)):
+                        is_expression = True
+                except SyntaxError:
+                    pass
+
+                # Wrap in an async function appropriately
+                if is_expression:
+                    # For expressions, we can return the value
+                    indented = '\n'.join('    ' + line for line in transformed_source.split('\n'))
+                    wrapped = f"async def _async_exec():\n    return (\n{indented}\n    )"
+                else:
+                    # For statements, just execute them
+                    indented = '\n'.join('    ' + line for line in transformed_source.split('\n'))
+                    wrapped = f"async def _async_exec():\n{indented}\n    return None"
+
+                exec(wrapped, self.namespace)
+                # Now, run the function we just evaluated.
+                # Use create_task for better cancellation support
+                self._current_future = asyncio.create_task(self.namespace['_async_exec']())
+
+                def done_callback(future):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            self._append_plain_text(repr(result) + '\n')
+                    except asyncio.CancelledError:
+                        # Don't show anything extra - already handled in interrupt handler
+                        # But ensure buffer is cleared (defensive)
+                        self._input_buffer = []
+                        pass
+                    except Exception as e:
+                        self._append_plain_text(f'Error: {type(e).__name__}: {e}\n')
+                    finally:
+                        # Clear the current future reference
+                        if self._current_future is future:
+                            self._current_future = None
+
+                    # Only show prompt if not cancelled (already shown in interrupt handler)
+                    if not future.cancelled():
+                        self._show_prompt(self._main_prompt)
+
+                self._current_future.add_done_callback(done_callback)
+            else:
+                # Try as expression first, then as a statement.
+                try:
+                    result = eval(full_source, self.namespace)
+                    if result is not None:
+                        self._append_plain_text(repr(result) + '\n')
+                except SyntaxError:
+                    # Try as a statement.
+                    exec(full_source, self.namespace)
+
+                self._show_prompt(self._main_prompt)
+        except Exception as e:
+            self._append_plain_text(f'Error: {type(e).__name__}: {e}\n')
+            self._show_prompt(self._main_prompt)
+            # Clear buffer on error to avoid getting stuck
+            self._input_buffer = []
+
+        return True
+
+
+class TviewTabbedConsole(QtWidgets.QTabWidget):
+    def __init__(self, parent=None, get_controller=None):
+        super().__init__(parent)
+
+        self.diagnostic_console = TviewConsoleWidget()
+        self.diagnostic_console.ansi_codes = False
+
+        self.addTab(self.diagnostic_console, "Diagnostic")
+
+        self.python_console = TviewPythonConsole(
+            get_controller=get_controller)
+        self.addTab(self.python_console, "Python")
+
+    def sizeHint(self):
+        return QtCore.QSize(600, 200)
+
 class Record:
     def __init__(self, archive):
         self.archive = archive
@@ -627,7 +1101,10 @@ class Device:
     STATE_SCHEMA = 3
     STATE_DATA = 4
 
-    def __init__(self, address, source_can_id, transport, console, prefix,
+    def __init__(self, address,
+                 source_can_id,
+                 python_source_can_id,
+                 transport, console, prefix,
                  config_tree_item, data_tree_item,
                  can_prefix, main_window, can_id):
         self.error_count = 0
@@ -636,6 +1113,7 @@ class Device:
 
         self.address = address
         self.source_can_id = source_can_id
+        self.python_source_can_id = python_source_can_id
         self._can_prefix = can_prefix
 
         # We keep around an estimate of the current CAN ID to enable
@@ -665,6 +1143,9 @@ class Device:
         self._data = {}
 
         self._updating_config = False
+
+        # Fault monitoring state
+        self.fault_state = FaultState()
 
     async def start(self):
         # Stop the spew.
@@ -1122,6 +1603,63 @@ class Device:
         _add_schema_item(item, schema_data)
         return item
 
+    async def check_fault_status(self):
+        """Check current fault status and return is_faulted, mode, fault_code)."""
+        result = await self.controller.custom_query({
+            Register.MODE: moteus.multiplex.INT8,
+            Register.FAULT: moteus.multiplex.INT8,
+        })
+
+        mode = result.values.get(Register.MODE, None)
+        fault_code = result.values.get(Register.FAULT, None)
+        is_faulted = (mode == Mode.FAULT) if mode is not None else False
+
+        return is_faulted, mode, fault_code
+
+    def update_fault_state(self, is_faulted):
+        """Update the fault state based on current status."""
+        previous_faulted = self.fault_state.is_faulted
+        fault_detected = False
+
+        if is_faulted and not previous_faulted:
+            # New fault detected - needs observation
+            self.fault_state.is_faulted = True
+            self.fault_state.observed = False
+            fault_detected = True
+        elif not is_faulted and previous_faulted:
+            # Fault cleared - mark as observed since it's no longer present
+            self.fault_state.is_faulted = False
+            self.fault_state.observed = True
+
+        return fault_detected
+
+    def mark_fault_observed(self):
+        """Mark the current fault as observed by the user."""
+        if self.fault_state.is_faulted:
+            self.fault_state.observed = True
+
+    def has_unobserved_fault(self):
+        """Check if device has a fault that hasn't been observed."""
+        return self.fault_state.is_faulted and not self.fault_state.observed
+
+    async def check_and_update_fault_state(self):
+        """Check fault status and update state. Returns (fault_detected, fault_cleared)."""
+        # Check current fault status
+        is_faulted, mode, fault_code = await self.check_fault_status()
+
+        # Store previous state to detect fault clearing
+        prev_faulted = self.fault_state.is_faulted
+
+        # Store current fault information for status bar
+        self.fault_state.current_mode = mode
+        self.fault_state.current_fault_code = fault_code
+
+        # Update fault state and check if new fault detected
+        fault_detected = self.update_fault_state(is_faulted)
+        fault_cleared = prev_faulted and not self.fault_state.is_faulted
+
+        return fault_detected, fault_cleared
+
 
 class TviewMainWindow():
     def __init__(self, options, parent=None):
@@ -1138,6 +1676,12 @@ class TviewMainWindow():
         self.expected_device_count = 0
         self.device_uuid_support = {}
         self.uuid_query_lock = asyncio.Lock()
+
+        # Fault monitoring infrastructure
+        self.fault_monitoring_task = None
+        self.fault_flash_timer = None
+        self.original_tab_color = None  # Store original tab color
+        self.fault_flash_state = False
 
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
         uifilename = os.path.join(current_script_dir, "tview_main_window.ui")
@@ -1163,6 +1707,10 @@ class TviewMainWindow():
         self.ui.telemetryTreeWidget.customContextMenuRequested.connect(
             self._handle_telemetry_context_menu)
 
+        # Track clicks for fault observation
+        self.ui.telemetryTreeWidget.itemClicked.connect(
+            self._handle_telemetry_item_clicked)
+
         self.ui.configTreeWidget.setItemDelegateForColumn(
             0, NoEditDelegate(self.ui))
         self.ui.configTreeWidget.setItemDelegateForColumn(
@@ -1176,10 +1724,13 @@ class TviewMainWindow():
         self.ui.plotItemRemoveButton.clicked.connect(
             self._handle_plot_item_remove)
 
-        self.console = TviewConsoleWidget()
-        self.console.ansi_codes = False
+        self.tabbed_console = TviewTabbedConsole(get_controller=self._python_get_controller)
+        self.ui.consoleDock.setWidget(self.tabbed_console)
+
+        self.console = self.tabbed_console.diagnostic_console
         self.console.line_input.connect(self._handle_user_input)
-        self.ui.consoleDock.setWidget(self.console)
+
+        self.python_console = self.tabbed_console.python_console
 
         self.ui.tabifyDockWidget(self.ui.configDock, self.ui.telemetryDock)
 
@@ -1289,6 +1840,8 @@ class TviewMainWindow():
         return len(matching_devices) == 1
 
     async def _populate_devices(self):
+        self.python_console.namespace['transport'] = self.transport
+
         self.devices = []
 
         targets = moteus.moteus_tool.expand_targets(self.options.devices)
@@ -1338,7 +1891,11 @@ class TviewMainWindow():
             data_item.setText(0, tree_key)
             self.ui.telemetryTreeWidget.addTopLevelItem(data_item)
 
-            device = Device(device_address, source_can_id,
+            python_source_can_id = source_can_id - 1
+
+            device = Device(device_address,
+                            source_can_id,
+                            python_source_can_id,
                             self.transport,
                             self.console, '{}>'.format(tree_key),
                             config_item,
@@ -1347,12 +1904,63 @@ class TviewMainWindow():
                             self,
                             current_can_id)
 
-            source_can_id -= 1
+            source_can_id -= 2
 
             config_item.setData(0, QtCore.Qt.UserRole, device)
+            data_item.setData(0, QtCore.Qt.UserRole, device)
             asyncio.create_task(device.start())
 
             self.devices.append(device)
+
+        # Start fault monitoring after all devices are created
+        if self.devices and not self.fault_monitoring_task:
+            self.fault_monitoring_task = asyncio.create_task(self._monitor_device_faults())
+
+        if self.devices:
+            self.python_console.namespace['controller'] = self._python_get_controller(self.devices[0].address)
+            self.python_console.namespace['controllers'] = [
+                self._python_get_controller(device.address)
+                for device in self.devices]
+
+    def _python_get_controller(self, name_or_address):
+        def get_device():
+            # Is this an address that matches one of our devices
+            # exactly?
+            maybe_device_by_address = [
+                device for device in self.devices
+                if (device.address == name_or_address
+                    or (isinstance(device.address, int) and
+                        isinstance(name_or_address, int) and
+                        device.address == name_or_address)
+                    or (not isinstance(device.address, int) and
+                        device.address.can_id is not None and
+                        isinstance(name_or_address, int) and
+                        device.address.can_id == name_or_address))
+            ]
+            if maybe_device_by_address:
+                return maybe_device_by_address[0]
+
+            # Can we look it up by name?
+            if isinstance(name_or_address, str):
+                maybe_devices = [x for x in self.devices
+                                 if self._match(x, name_or_address)]
+                if maybe_devices:
+                    return maybe_devices[0]
+
+            return None
+
+        device = get_device()
+        if device:
+            return moteus.Controller(
+                device.address,
+                source_can_id=device.python_source_can_id,
+                can_prefix=self.options.can_prefix)
+
+        # It doesn't appear to match one of our existing devices.
+        # Just try to make a new instance assuming it is address-like.
+        return moteus.Controller(
+            name_or_address,
+            can_prefix=self.options.can_prefix)
 
     def _handle_startup(self):
         self.console._control.setFocus()
@@ -1533,12 +2141,23 @@ class TviewMainWindow():
     def _handle_tree_expanded(self, item):
         self.ui.telemetryTreeWidget.resizeColumnToContents(0)
         user_data = item.data(0, QtCore.Qt.UserRole)
-        if user_data:
+        if (user_data and
+            hasattr(user_data, 'expand') and
+            callable(user_data.expand)):
             user_data.expand()
+
+        # Mark fault as observed if expanding servo_stats while
+        # telemetry is visible
+
+        if (self.ui.telemetryDock.isVisible() and
+            item.text(0).lower() == "servo_stats"):
+            device = self._find_device_from_tree_item(item)
+            if device and device.has_unobserved_fault():
+                self._mark_fault_observed(device)
 
     def _handle_tree_collapsed(self, item):
         user_data = item.data(0, QtCore.Qt.UserRole)
-        if user_data:
+        if user_data and hasattr(user_data, 'collapse') and callable(user_data.collapse):
             user_data.collapse()
 
     def _handle_telemetry_context_menu(self, pos):
@@ -1640,6 +2259,260 @@ class TviewMainWindow():
         item = self.ui.plotItemCombo.itemData(index)
         self.ui.plotWidget.remove_plot(item)
         self.ui.plotItemCombo.removeItem(index)
+
+    # Fault Monitoring System
+    async def _monitor_device_faults(self):
+        """Continuously monitor devices for fault conditions."""
+        # Wait for devices to initialize
+
+        # Start monitoring immediately - devices can handle queries during initialization
+
+        while True:
+            try:
+                await asyncio.sleep(FAULT_POLLING_INTERVAL_MS / 1000.0)
+
+                fault_detected = False
+                for device in self.devices:
+                    # Check and update fault state for this device
+                    device_fault_detected, device_fault_cleared = await device.check_and_update_fault_state()
+                    if device_fault_detected:
+                        fault_detected = True
+                    if device_fault_cleared:
+                        # Clear highlighting for this device when fault is cleared
+                        self._clear_device_highlighting(device)
+
+                # Start/stop flashing based on unobserved faults
+                if fault_detected:
+                    self._start_fault_flashing()
+                elif self._all_faults_observed():
+                    self._stop_fault_flashing()
+
+                # Update status bar with current fault information
+                self._update_fault_status_bar()
+
+            except Exception as e:
+                print(f"Error in fault monitoring: {e}")
+                await asyncio.sleep(1.0)
+
+    def _all_faults_observed(self):
+        """Check if all current faults have been visually observed."""
+        return all(not device.has_unobserved_fault() for device in self.devices)
+
+    def _start_fault_flashing(self):
+        """Start visual fault indicators."""
+        if self.fault_flash_timer is None:
+            self.fault_flash_timer = QtCore.QTimer()
+            self.fault_flash_timer.timeout.connect(self._toggle_fault_flash)
+            self.fault_flash_timer.start(500)
+            self._toggle_fault_flash()
+
+    def _stop_fault_flashing(self):
+        """Stop visual fault indicators."""
+        if self.fault_flash_timer is not None:
+            self.fault_flash_timer.stop()
+            self.fault_flash_timer = None
+            self._clear_fault_highlighting()
+
+    def _toggle_fault_flash(self):
+        """Toggle fault visual indicators."""
+        self.fault_flash_state = not self.fault_flash_state
+        color = "#FF4444" if self.fault_flash_state else "#FFA500"
+
+        for device in self.devices:
+            if device.has_unobserved_fault():
+                self._highlight_device_fault(device, color)
+
+    def _highlight_device_fault(self, device, color):
+        """Apply fault highlighting to UI elements."""
+        self._highlight_telemetry_tab(color)
+        self._highlight_device_tree_items(device, color)
+        self._highlight_servo_stats(device, color)
+
+    def _highlight_telemetry_tab(self, color):
+        """Flash telemetry tab text to indicate fault."""
+        tab_bars = self.ui.findChildren(QtWidgets.QTabBar)
+        for tab_bar in tab_bars:
+            for i in range(tab_bar.count()):
+                if "telemetry" in tab_bar.tabText(i).lower():
+                    # Store original color on first modification
+                    if self.original_tab_color is None:
+                        # Get the actual default color from the palette since tabTextColor
+                        # returns invalid QColor() for tabs that haven't been modified
+                        self.original_tab_color = tab_bar.palette().color(QtGui.QPalette.WindowText)
+
+                    # This is the best visual indicator I've managed
+                    # to find for tab text.
+                    if self.fault_flash_state:
+                        tab_bar.setTabTextColor(i, QtGui.QColor("#FF0000"))
+                    else:
+                        tab_bar.setTabTextColor(i, QtGui.QColor("#FF8800"))
+                    return
+
+    def _highlight_device_tree_items(self, device, color):
+        """Highlight device tree items in telemetry view."""
+        # Only highlight if device has unobserved fault
+        if hasattr(device, '_data_tree_item') and device.has_unobserved_fault():
+            brush = QtGui.QBrush(QtGui.QColor(color))
+            device._data_tree_item.setBackground(0, brush)
+            device._data_tree_item.setBackground(1, brush)
+
+    def _highlight_servo_stats(self, device, color):
+        """Highlight servo_stats entry for device."""
+        # Only highlight if device has unobserved fault
+        if hasattr(device, '_data_tree_item') and device.has_unobserved_fault():
+            for i in range(device._data_tree_item.childCount()):
+                child = device._data_tree_item.child(i)
+                if child.text(0) == 'servo_stats':
+                    brush = QtGui.QBrush(QtGui.QColor(color))
+                    child.setBackground(0, brush)
+                    child.setBackground(1, brush)
+                    break
+
+    def _clear_fault_highlighting(self):
+        """Clear all fault highlighting."""
+        # Clear telemetry tab color
+        tab_bars = self.ui.findChildren(QtWidgets.QTabBar)
+        for tab_bar in tab_bars:
+            for i in range(tab_bar.count()):
+                if "telemetry" in tab_bar.tabText(i).lower():
+                    # Reset the color using the stored original
+                    if self.original_tab_color and self.original_tab_color.isValid():
+                        tab_bar.setTabTextColor(i, self.original_tab_color)
+                    break  # Found and processed the telemetry tab
+
+        # Clear tree highlighting for all devices
+        for device in self.devices:
+            self._clear_device_highlighting(device)
+
+    def _clear_device_highlighting(self, device):
+        """Clear fault highlighting for a specific device."""
+        if hasattr(device, '_data_tree_item'):
+            device._data_tree_item.setBackground(0, QtGui.QBrush())
+            device._data_tree_item.setBackground(1, QtGui.QBrush())
+            # Clear servo_stats
+            for i in range(device._data_tree_item.childCount()):
+                child = device._data_tree_item.child(i)
+                if child.text(0) == 'servo_stats':
+                    child.setBackground(0, QtGui.QBrush())
+                    child.setBackground(1, QtGui.QBrush())
+
+    # Observation Tracking
+    def _handle_telemetry_item_clicked(self, item, column):
+        """Handle clicks on telemetry items for fault observation."""
+        if not self.ui.telemetryDock.isVisible():
+            return
+
+        # We only consider a fault observed if the user expanded or
+        # clicked on the 'servo_stats' entry, or the 'fault' or 'mode'
+        # elements of 'servo_stats.
+        item_text = item.text(0).lower()
+        if item_text == "servo_stats":
+            # Only count servo_stats click as observation if it's already expanded
+            if item.isExpanded():
+                device = self._find_device_from_tree_item(item)
+            else:
+                return  # Don't count clicks on collapsed servo_stats
+        elif item_text in ["mode", "fault"] and item.parent() and item.parent().text(0).lower() == "servo_stats":
+            device = self._find_device_from_tree_item(item.parent().parent())
+        else:
+            return
+
+        if device and device.has_unobserved_fault():
+            self._mark_fault_observed(device)
+
+    def _find_device_from_tree_item(self, item):
+        """Find device associated with tree item."""
+        if not item:
+            return None
+
+        # Traverse up to top-level item
+        current = item
+        while current.parent():
+            current = current.parent()
+
+        # Check if top-level item has device data
+        device_data = current.data(0, QtCore.Qt.UserRole)
+        if isinstance(device_data, Device):
+            return device_data
+
+        # Fallback: search by tree item reference
+        for device in self.devices:
+            if hasattr(device, '_data_tree_item') and device._data_tree_item == current:
+                return device
+
+        return None
+
+    def _mark_fault_observed(self, device):
+        """Mark device fault as visually observed."""
+        device.mark_fault_observed()
+
+        # Clear highlighting for this specific device immediately
+        self._clear_device_highlighting(device)
+
+        # Check if all faults are now observed and stop global flashing if so
+        if self._all_faults_observed():
+            self._stop_fault_flashing()
+
+        # Update status bar to reflect observed fault
+        self._update_fault_status_bar()
+
+    def _update_fault_status_bar(self):
+        """Update the status bar with current fault information."""
+        # Collect all faulted devices
+        faulted_devices = []
+        for device in self.devices:
+            if device.fault_state.is_faulted:
+                faulted_devices.append(device)
+
+        if not faulted_devices:
+            # No faults - clear status bar
+            self.ui.statusbar.clearMessage()
+            return
+
+        FULL_LIST_COUNT = 2
+
+        if len(faulted_devices) == 1:
+            # Single fault - show device and fault code with description
+            device = faulted_devices[0]
+            fault_code = device.fault_state.current_fault_code
+            fault_text = _format_fault_code(fault_code)
+            if fault_text:
+                message = f"Fault: {device.address} {fault_text}"
+            else:
+                message = f"Fault: {device.address}"
+        elif len(faulted_devices) <= FULL_LIST_COUNT:
+            # Multiple faults - show compact list with descriptions
+            fault_strs = []
+            for device in faulted_devices:
+                fault_code = device.fault_state.current_fault_code
+                fault_text = _format_fault_code(fault_code)
+                if fault_text:
+                    fault_strs.append(f"{device.address} {fault_text}")
+                else:
+                    fault_strs.append(f"{device.address}")
+            message = f"Faults: {', '.join(fault_strs)}"
+        else:
+            # Many faults - show count with tooltip
+            message = f"Faults: {len(faulted_devices)} devices - hover for details"
+
+            # Create tooltip with detailed fault information including descriptions
+            tooltip_lines = []
+            for device in faulted_devices:
+                fault_code = device.fault_state.current_fault_code
+                fault_text = _format_fault_code(fault_code)
+                if fault_text:
+                    tooltip_lines.append(f"{device.address} {fault_text}")
+                else:
+                    tooltip_lines.append(f"{device.address}")
+            tooltip = "\n".join(tooltip_lines)
+            self.ui.statusbar.setToolTip(tooltip)
+
+        # Display the message
+        self.ui.statusbar.showMessage(message)
+
+        # Clear tooltip if not many faults
+        if len(faulted_devices) <= FULL_LIST_COUNT:
+            self.ui.statusbar.setToolTip("")
 
 
 def main():
