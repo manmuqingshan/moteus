@@ -36,6 +36,10 @@
             - set_aux_pwm
             - make_aux_pwm
 
+## moteus.move_to
+
+::: moteus.move_to
+
 ## moteus.make_transport_args
 
 ::: moteus.make_transport_args
