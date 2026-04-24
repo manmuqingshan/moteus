@@ -1381,8 +1381,12 @@ class BldcServoControl {
 
   void ISR_DoStopped(const SinCos& sin_cos) MOTEUS_CCM_ATTRIBUTE {
     if (self().status_.cooldown_count) {
+      if (self().status_.cooldown_count > self().config_.cooldown_brake) {
+        ISR_DoCurrent(sin_cos, 0.0f, 0.0f, 0.0f, false);
+      } else {
+        self().DoBrake();
+      }
       self().status_.cooldown_count--;
-      ISR_DoCurrent(sin_cos, 0.0f, 0.0f, 0.0f, false);
       return;
     }
 
@@ -1625,6 +1629,8 @@ class BldcServoControl {
 
     if (current_control()) {
       self().status_.cooldown_count = self().config_.cooldown_cycles;
+    } else if (torque_on()) {
+      self().status_.cooldown_count = self().config_.cooldown_brake;
     }
 
     switch (self().status_.mode) {

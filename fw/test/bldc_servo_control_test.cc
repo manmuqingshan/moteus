@@ -877,12 +877,21 @@ BOOST_AUTO_TEST_CASE(BldcServoControlDoStopped) {
   BOOST_TEST(ctx.hard_stop_count == 1);
   BOOST_TEST(ctx.status_.power_W == 0.0f);
 
-  // With cooldown, should call ISR_DoCurrent instead.
+  // With cooldown > brake threshold, should call ISR_DoCurrent instead.
+  ctx.status_.cooldown_count = ctx.config_.cooldown_brake + 1;
+  ctx.ISR_DoStopped(sc);
+  BOOST_TEST(ctx.brake_count == 0);
+  BOOST_TEST(ctx.hard_stop_count == 1);  // unchanged
+  BOOST_TEST(ctx.status_.cooldown_count == (ctx.config_.cooldown_brake));
+  BOOST_TEST(ctx.pwm_control_count == 1);  // ISR_DoCurrent drove PWM
+
+  // And with a small cooldown, we should call brake.
   ctx.status_.cooldown_count = 3;
   ctx.ISR_DoStopped(sc);
+  BOOST_TEST(ctx.brake_count == 1);
   BOOST_TEST(ctx.hard_stop_count == 1);  // unchanged
+  BOOST_TEST(ctx.pwm_control_count == 1);  // unchanged
   BOOST_TEST(ctx.status_.cooldown_count == 2);
-  BOOST_TEST(ctx.pwm_control_count == 1);  // ISR_DoCurrent drove PWM
 }
 
 BOOST_AUTO_TEST_CASE(BldcServoControlDoMeasureInductance) {
