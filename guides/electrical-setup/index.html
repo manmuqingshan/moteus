@@ -766,10 +766,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#flux-braking" class="md-nav__link">
+  <a href="#software-protections" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Flux braking
+        Software protections
       
     </span>
   </a>
@@ -777,10 +777,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#design-considerations-for-regenerative-braking" class="md-nav__link">
+  <a href="#hardware-design-considerations" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Design considerations for regenerative braking
+        Hardware design considerations
       
     </span>
   </a>
@@ -993,6 +993,8 @@
       
         
       
+        
+      
     
     
     
@@ -1086,6 +1088,34 @@
     
   
     Dual Encoders
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../field-weakening/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Field Weakening
   
 
     
@@ -2468,10 +2498,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#flux-braking" class="md-nav__link">
+  <a href="#software-protections" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Flux braking
+        Software protections
       
     </span>
   </a>
@@ -2479,10 +2509,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#design-considerations-for-regenerative-braking" class="md-nav__link">
+  <a href="#hardware-design-considerations" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Design considerations for regenerative braking
+        Hardware design considerations
       
     </span>
   </a>
@@ -2597,13 +2627,16 @@
 <p>moteus can be commanded to sharply decelerate loads, either directly in response to commands, or due to external disturbances.  When braking a load, moteus by default applies the generated power to the input DC bus.</p>
 <p>If there is nowhere for this power to go, this can cause problems.  The voltage can increase without bound, which in mild cases will cause the CAN transceiver on all devices connected to the bus to fail, and in severe cases can explode the main FETs or other components on the board.</p>
 <p>Here's what you should know about the facilities moteus has to deal with this, and what you can do to make your design safer.</p>
-<h3 id="flux-braking">Flux braking<a class="headerlink" href="#flux-braking" title="Permanent link">&para;</a></h3>
-<p>The feature within moteus itself to deal with this is "flux braking".  The flux braking implementation will dissipate extra power in the windings of the motor when the bus voltage gets above a certain threshold.  This is controlled by the <code>servo.flux_brake_margin_voltage</code> and <code>servo.flux_brake_resistance_ohm</code> parameters documented above.</p>
-<h3 id="design-considerations-for-regenerative-braking">Design considerations for regenerative braking<a class="headerlink" href="#design-considerations-for-regenerative-braking" title="Permanent link">&para;</a></h3>
+<h3 id="software-protections">Software protections<a class="headerlink" href="#software-protections" title="Permanent link">&para;</a></h3>
+<p>moteus has several configurable mechanisms to limit regenerative voltage rise.  For full tuning details, see <a href="../../troubleshooting/overvoltage-fault-34/">Troubleshooting Overvoltage Fault 34</a>.</p>
+<p><strong>Acceleration limits</strong>: Setting <code>servo.default_accel_limit</code> (or per-command <code>accel_limit</code>) controls how quickly braking torque is applied.  This is the most direct way to limit the rate of regenerative power injection.</p>
+<p><strong>Regen power limiting</strong>: Setting <code>servo.max_regen_power_W</code> limits how much power is allowed to flow back to the bus during braking.  Excess energy is pre-emptively dissipated in the motor windings via d-axis current injection.  For a supply that cannot absorb any regenerative energy, set this to a small number like <code>10</code> or even <code>0</code>.</p>
+<p><strong>Flux braking</strong>: When bus voltage rises above <code>servo.max_voltage - servo.flux_brake_margin_voltage</code>, moteus dissipates energy in the motor windings to resist further voltage rise.  This is controlled by <code>servo.flux_brake_margin_voltage</code> and <code>servo.flux_brake_resistance_ohm</code>.</p>
+<h3 id="hardware-design-considerations">Hardware design considerations<a class="headerlink" href="#hardware-design-considerations" title="Permanent link">&para;</a></h3>
 <p>The following design considerations can be used to minimize the risk of damage to hardware in the event of overvoltage.  These are not a substitute for validation in progressively more demanding situations, but they can help you start off in a good place.</p>
 <ul>
 <li>
-<p><em>Tightly scope the over-voltage fault / flux braking</em>: The configuration parameter <code>servo.max_voltage</code> can be lowered for all devices on the bus.  This will both cause a fault if the voltage exceeds this value and in conjuction with <code>servo.flux_brake_margin_voltage</code>, select the point at which moteus will attempt to dissipate energy to prevent an overvoltage scenario.  It is recommended to set this to no less than 5V above the maximum expected supply voltage.</p>
+<p><em>Tightly scope the over-voltage fault / flux braking</em>: The configuration parameter <code>servo.max_voltage</code> can be lowered for all devices on the bus.  This will both cause a fault if the voltage exceeds this value and in conjunction with <code>servo.flux_brake_margin_voltage</code>, select the point at which moteus will attempt to dissipate energy to prevent an overvoltage scenario.  It is recommended to set this to no less than 5V above the maximum expected supply voltage.</p>
 </li>
 <li>
 <p><em>Power from a battery, not a PSU</em>: When not charged, batteries are capable of sinking current to minimize over-voltage transients.  However, if the battery is fully charged, most battery management systems drastically reduce the allowable charging current.  Thus, a battery is only useful as a mitigation if it is never charged above say 75 or 80% state of charge.</p>
