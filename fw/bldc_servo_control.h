@@ -1640,7 +1640,7 @@ class BldcServoControl {
         break;
       }
       case kFault: {
-        self().DoFault();
+        ISR_DoStopped(sin_cos);
         break;
       }
       case kEnabling: {

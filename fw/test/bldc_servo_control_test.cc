@@ -46,7 +46,6 @@ struct Context : public BldcServoControl<Context> {
   Vec3 last_pwm;
 
   int hard_stop_count = 0;
-  int fault_count = 0;
   int calibrating_count = 0;
   int brake_count = 0;
   int start_calibrating_count = 0;
@@ -64,10 +63,6 @@ struct Context : public BldcServoControl<Context> {
 
   void DoHardStop() {
     hard_stop_count++;
-  }
-
-  void DoFault() {
-    fault_count++;
   }
 
   void DoCalibrating() {
