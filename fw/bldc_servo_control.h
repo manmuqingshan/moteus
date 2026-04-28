@@ -346,10 +346,14 @@ class BldcServoControl {
     fw_V_eff_factor_ =
         self().rate_config_.max_voltage_ratio *
         (1.0f - self().config_.fw.modulation_margin) * 0.5f;
+    // When v_per_hz_ is 0 (motor not yet calibrated), there is no
+    // back-EMF model and no voltage-derived velocity limit applies.
+    // Return infinity so motor_max_velocity does not clamp the
+    // velocity command to 0 during encoder calibration.
     half_max_voltage_ratio_over_v_per_hz_ =
         (v_per_hz_ > 0.0f) ?
         (self().rate_config_.max_voltage_ratio * 0.5f / v_per_hz_) :
-        0.0f;
+        std::numeric_limits<float>::infinity();
     max_V_factor_ =
         self().rate_config_.max_voltage_ratio * kSvpwmRatio * 0.5f;
     fw_max_current_A_ =

@@ -679,6 +679,36 @@ BOOST_AUTO_TEST_CASE(BldcServoControlDoCurrentFieldWeakening) {
   BOOST_TEST(ctx.status_.fw.id_A < 0.0f);
 }
 
+// Regression: with motor.Kv == 0 (motor not yet calibrated, e.g.
+// during the encoder-mapping phase of moteus_tool's calibration),
+// ISR_CalculateDerivedQuantities must not produce a zero
+// motor_max_velocity.  BldcServoPosition::UpdateCommand clamps
+// control_velocity to [-motor_max_velocity, motor_max_velocity], so a
+// zero limit pins the velocity to 0 in kPosition mode.  That mode is
+// what the firmware's "d cali" command (used by current-mode encoder
+// calibration) drives, so a zero limit prevents the motor from
+// spinning during calibration.
+BOOST_AUTO_TEST_CASE(BldcServoControlMotorMaxVelocityWhenUncalibrated) {
+  Context ctx;
+  ctx.status_.bus_V = 24.0f;
+  ctx.status_.filt_bus_V = 24.0f;
+  ctx.position_.epoch = 0;
+  ctx.isr_motor_position_epoch_ = 0;
+  ctx.motor_.poles = 2;
+  // motor_.Kv intentionally left at 0 (uncalibrated).
+  ctx.motor_position_config_val.output.sign = 1;
+  ctx.motor_position_config_val.rotor_to_output_ratio = 1.0f;
+
+  ctx.UpdateDerivedMotorConstants();
+  ctx.UpdateFieldWeakeningIdChar();
+
+  ctx.ISR_CalculateDerivedQuantities(0.0f, 0.0f, 0.0f, false);
+
+  // Must permit a normal calibration speed without clamping.  The
+  // default cal_ll_encoder_speed in moteus_tool is 1 rev/s.
+  BOOST_TEST(ctx.status_.motor_max_velocity > 1.0f);
+}
+
 BOOST_AUTO_TEST_CASE(BldcServoControlDoPosition) {
   Context ctx;
   ctx.status_.filt_bus_V = 24.0f;
