@@ -133,7 +133,14 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
   int hard_stop_count = 0;
   int calibrating_count = 0;
   int brake_count = 0;
+  int hiz_count = 0;
   int start_calibrating_count = 0;
+
+  // Set true by DoHiz, cleared by any other Do* method.  Captured at the
+  // start of StepSimulation as the "previous cycle's HiZ state" so the
+  // motor sim can apply HiZ behavior with the same one-cycle delay used
+  // for PWM.
+  bool hiz_pending_ = false;
 
   bool fault_state = false;
 
@@ -254,19 +261,23 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
   // HW methods required by BldcServoControl.
   void DoPwmControl(const Vec3& pwm) {
     pwm_control_count++;
+    hiz_pending_ = false;
     last_pwm = pwm;
   }
 
   void DoHardStop() {
     hard_stop_count++;
+    hiz_pending_ = false;
   }
 
   void DoCalibrating() {
     calibrating_count++;
+    hiz_pending_ = false;
   }
 
   void DoBrake() {
     brake_count++;
+    hiz_pending_ = false;
     // Brake mode shorts all phases together and to ground.
 
     // With zero phase-to-neutral voltage, the motor back-EMF drives
@@ -275,8 +286,18 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
     last_pwm = Vec3{0.0f, 0.0f, 0.0f};
   }
 
+  void DoHiz() {
+    hiz_count++;
+    hiz_pending_ = true;
+    // High-impedance: all FETs off.  The motor sim handles this via
+    // StepHiz when prior_hiz is captured at the next step; last_pwm is
+    // not used in that path.
+    last_pwm = Vec3{0.0f, 0.0f, 0.0f};
+  }
+
   void StartCalibrating() {
     start_calibrating_count++;
+    hiz_pending_ = false;
     // For simulation, immediately complete calibration
     status_.mode = kCalibrationComplete;
   }
@@ -306,6 +327,7 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
   // Step the simulation by one control cycle.
   void StepSimulation(BldcServoCommandData* cmd) {
     const auto prior_pwm = last_pwm;
+    const bool prior_hiz = hiz_pending_;
     const float dt = rate_config_.period_s;
 
     // 1. Update encoder from motor rotor position.
@@ -329,9 +351,11 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
     // and ISR_DoControl (which checks bus_V for over-voltage fault).
     if (bus_resistance_ohm_ > 0.0f) {
       const auto phase_cur = motor_sim_.phase_currents();
-      const float i_bus = prior_pwm.a * phase_cur.a +
-                          prior_pwm.b * phase_cur.b +
-                          prior_pwm.c * phase_cur.c;
+      // In HiZ all FETs are off, so no current flows through the bridge.
+      const float i_bus = prior_hiz ? 0.0f :
+          (prior_pwm.a * phase_cur.a +
+           prior_pwm.b * phase_cur.b +
+           prior_pwm.c * phase_cur.c);
 
       if (bus_capacitance_F_ > 0.0f) {
         // Dynamic RC model.
@@ -366,18 +390,23 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
 
     // 6. Apply the previous cycle's PWM to the motor to achieve a
     // realistic one-cycle delay.
+    if (prior_hiz) {
+      // All FETs off: phase currents are forced to zero, mechanical
+      // dynamics continue under viscous damping and external load.
+      motor_sim_.StepHiz(dt, external_torque_);
+    } else {
+      // Convert PWM to phase-to-neutral voltages.
+      const float v_a_raw = prior_pwm.a * bus_voltage_;
+      const float v_b_raw = prior_pwm.b * bus_voltage_;
+      const float v_c_raw = prior_pwm.c * bus_voltage_;
 
-    // Convert PWM to phase-to-neutral voltages.
-    const float v_a_raw = prior_pwm.a * bus_voltage_;
-    const float v_b_raw = prior_pwm.b * bus_voltage_;
-    const float v_c_raw = prior_pwm.c * bus_voltage_;
-
-    // Compute neutral point and subtract to get phase-to-neutral voltages
-    const float v_neutral = (v_a_raw + v_b_raw + v_c_raw) / 3.0f;
-    const float v_a = v_a_raw - v_neutral;
-    const float v_b = v_b_raw - v_neutral;
-    const float v_c = v_c_raw - v_neutral;
-    motor_sim_.Step(dt, v_a, v_b, v_c, external_torque_);
+      // Compute neutral point and subtract to get phase-to-neutral voltages
+      const float v_neutral = (v_a_raw + v_b_raw + v_c_raw) / 3.0f;
+      const float v_a = v_a_raw - v_neutral;
+      const float v_b = v_b_raw - v_neutral;
+      const float v_c = v_c_raw - v_neutral;
+      motor_sim_.Step(dt, v_a, v_b, v_c, external_torque_);
+    }
   }
 
   // Run simulation for a given duration.
@@ -438,6 +467,7 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
 
     external_torque_ = 0.0f;
     last_pwm = Vec3{0.5f, 0.5f, 0.5f};  // Neutral PWM
+    hiz_pending_ = false;
 
     // Reset bus voltage to source if dynamic model is active.
     if (bus_resistance_ohm_ > 0.0f) {

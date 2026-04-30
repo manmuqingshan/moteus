@@ -1264,6 +1264,13 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     motor_driver_->PowerOn();
   }
 
+  void DoHiz() MOTEUS_CCM_ATTRIBUTE {
+    *pwm1_ccr_ = 0;
+    *pwm2_ccr_ = 0;
+    *pwm3_ccr_ = 0;
+    motor_driver_->PowerOff();
+  }
+
   void StartCalibrating() MOTEUS_CCM_ATTRIBUTE {
     (*pwm1_ccr_) = 0;
     (*pwm2_ccr_) = 0;

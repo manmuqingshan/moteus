@@ -1388,7 +1388,7 @@ class BldcServoControl {
       if (self().status_.cooldown_count > self().config_.cooldown_brake) {
         ISR_DoCurrent(sin_cos, 0.0f, 0.0f, 0.0f, false);
       } else {
-        self().DoBrake();
+        self().DoHiz();
       }
       self().status_.cooldown_count--;
       return;
