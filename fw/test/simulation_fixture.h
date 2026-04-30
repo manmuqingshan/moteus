@@ -267,7 +267,12 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
 
   void DoHardStop() {
     hard_stop_count++;
-    hiz_pending_ = false;
+    // Real firmware powers off the motor driver here (see
+    // bldc_servo.cc DoHardStop), which is electrically a high-
+    // impedance state.  Mirror that in the sim so the motor sees
+    // open-circuit windings while we are stopped.
+    hiz_pending_ = true;
+    last_pwm = Vec3{0.0f, 0.0f, 0.0f};
   }
 
   void DoCalibrating() {
@@ -297,7 +302,13 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
 
   void StartCalibrating() {
     start_calibrating_count++;
-    hiz_pending_ = false;
+    // Real firmware (bldc_servo.cc StartCalibrating) calls
+    // motor_driver_->PowerOff(), which puts the FETs in HiZ for the
+    // entire calibration window.  Mirror that here so the motor
+    // continues to see open-circuit windings up to the moment we
+    // transition into the requested current-controlled mode.
+    hiz_pending_ = true;
+    last_pwm = Vec3{0.0f, 0.0f, 0.0f};
     // For simulation, immediately complete calibration
     status_.mode = kCalibrationComplete;
   }
@@ -462,6 +473,13 @@ class SimulationContext : public BldcServoControl<SimulationContext> {
     // Set status from position (now 0 after ISR_SetOutputPosition)
     status_.position = position_.position;
     status_.velocity = position_.velocity;
+    // Real firmware updates velocity_filt every ISR cycle from
+    // position_.velocity.  In the simulation fixture there is no
+    // step between Reset() and the next Command(), so any code that
+    // reads velocity_filt before the first step (mode-entry seeding
+    // in particular) would otherwise see the stale value left from
+    // the previous test's run.
+    status_.velocity_filt = 0.0f;
     status_.mode = kStopped;
     status_.fault = errc::kSuccess;
 

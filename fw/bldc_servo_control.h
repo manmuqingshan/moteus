@@ -691,6 +691,42 @@ class BldcServoControl {
     }
   }
 
+  // Ensure that the Q axis PID controller starts out with a
+  // reasonable value when initiating current mode control.  This
+  // avoids a discontinuity if the system is already spinning when
+  // control is first initiated.
+  //
+  // This is only needed if `servo.bemf_feedforward<1`.  Scale the
+  // correction accordingly.
+  void ISR_InitializePidForBemf() MOTEUS_CCM_ATTRIBUTE {
+    switch (self().status_.mode) {
+      case kCurrent:
+      case kPosition:
+      case kPositionTimeout:
+      case kZeroVelocity:
+      case kStayWithinBounds:
+        // We aren't switching to current mode.
+        break;
+      default:
+        return;
+    }
+
+    if (self().config_.voltage_mode_control) {
+      // If "voltage mode control" is used, then we also don't use the
+      // actual current loop.
+      return;
+    }
+
+    if (self().v_per_hz_ <= 0.0f) { return; }
+
+    const float velocity_rotor =
+        self().status_.velocity_filt * self().inv_rotor_to_output_ratio_;
+    const float pid_q_share =
+        std::max(0.0f, 1.0f - self().config_.bemf_feedforward);
+    self().status_.pid_q.integral =
+        -velocity_rotor * self().v_per_hz_ * pid_q_share;
+  }
+
   void ISR_DoPwmControl(const Vec3& pwm) MOTEUS_CCM_ATTRIBUTE {
     self().control_.pwm.a = LimitPwm(pwm.a);
     self().control_.pwm.b = LimitPwm(pwm.b);
@@ -1557,6 +1593,7 @@ class BldcServoControl {
             } else {
               self().status_.mode = data->mode;
               ISR_ClearPid(kAlwaysClear);
+              ISR_InitializePidForBemf();
             }
 
             if (data->mode == kMeasureInductance) {
